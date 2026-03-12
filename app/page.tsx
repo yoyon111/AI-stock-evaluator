@@ -598,7 +598,7 @@ export default function Dashboard() {
 
               <div className="prose prose-invert prose-sm max-w-none">
                 <pre className="whitespace-pre-wrap text-gray-300 text-sm leading-relaxed font-mono bg-transparent border-0 p-0">
-                  {currentReport.report}
+                  {currentReport.report.replace(/\n*##\s*Sources[\s\S]*$/i, '').trimEnd()}
                 </pre>
               </div>
 
