@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { createClient } from './lib/supabase'
 import { useRouter } from 'next/navigation'
 
@@ -14,16 +14,49 @@ interface Report {
   created_at: string
 }
 
+interface AgentStep {
+  agent: string
+  label: string
+  icon: string
+  status: 'waiting' | 'running' | 'done'
+  message: string
+  subSteps: string[]
+}
+
+const AGENT_ORDER = ['planner', 'researcher', 'quant', 'qual', 'moderator', 'writer']
+
+const AGENT_DEFAULTS: Record<string, { label: string; icon: string }> = {
+  planner:    { label: 'Planner',       icon: '🎯' },
+  researcher: { label: 'Researcher',    icon: '🔍' },
+  quant:      { label: 'Quant Analyst', icon: '📊' },
+  qual:       { label: 'Qual Analyst',  icon: '📰' },
+  moderator:  { label: 'Moderator',     icon: '⚖️' },
+  writer:     { label: 'Writer',        icon: '📄' },
+}
+
+function initSteps(): AgentStep[] {
+  return AGENT_ORDER.map(id => ({
+    agent: id,
+    label: AGENT_DEFAULTS[id].label,
+    icon:  AGENT_DEFAULTS[id].icon,
+    status: 'waiting',
+    message: 'Waiting...',
+    subSteps: [],
+  }))
+}
+
 export default function Dashboard() {
-  const [query, setQuery] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [reports, setReports] = useState<Report[]>([])
-  const [status, setStatus] = useState('')
+  const [query, setQuery]               = useState('')
+  const [loading, setLoading]           = useState(false)
+  const [reports, setReports]           = useState<Report[]>([])
   const [currentReport, setCurrentReport] = useState<Report | null>(null)
-  const [error, setError] = useState('')
+  const [error, setError]               = useState('')
   const [showExportMenu, setShowExportMenu] = useState(false)
-  const router = useRouter()
+  const [agentSteps, setAgentSteps]     = useState<AgentStep[]>(initSteps())
+  const [activeAgent, setActiveAgent]   = useState<string | null>(null)
+  const router  = useRouter()
   const supabase = createClient()
+  const abortRef = useRef<(() => void) | null>(null)
 
   useEffect(() => {
     checkAuth()
@@ -43,18 +76,28 @@ export default function Dashboard() {
   async function fetchReports() {
     const token = await getToken()
     if (!token) return
-
     try {
       const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/reports`, {
         headers: { Authorization: `Bearer ${token}` }
       })
-      if (res.ok) {
-        const data = await res.json()
-        setReports(data)
-      }
+      if (res.ok) setReports(await res.json())
     } catch (err) {
       console.error('Failed to fetch reports:', err)
     }
+  }
+
+  function updateStep(agentId: string, patch: Partial<AgentStep>) {
+    setAgentSteps(prev => prev.map(s =>
+      s.agent === agentId ? { ...s, ...patch } : s
+    ))
+  }
+
+  function addSubStep(agentId: string, msg: string) {
+    setAgentSteps(prev => prev.map(s =>
+      s.agent === agentId
+        ? { ...s, subSteps: [...s.subSteps.slice(-4), msg] }   // keep last 5
+        : s
+    ))
   }
 
   async function handleResearch(e: React.FormEvent) {
@@ -64,35 +107,101 @@ export default function Dashboard() {
     setLoading(true)
     setCurrentReport(null)
     setError('')
-    setStatus('🔍 Planner identifying tickers and intents...')
+    setAgentSteps(initSteps())
+    setActiveAgent('planner')
 
     const token = await getToken()
+    if (!token) { setLoading(false); return }
+
+    const ctrl = new AbortController()
+    abortRef.current = () => ctrl.abort()
 
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/research`, {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/research/stream`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
+          Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ query })
+        body: JSON.stringify({ query }),
+        signal: ctrl.signal,
       })
 
-      if (!res.ok) {
-        const errorData = await res.json().catch(() => ({}))
-        throw new Error(errorData.detail || 'Research failed')
+      if (!res.ok || !res.body) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error((err as any).detail || 'Research failed')
       }
 
-      const data = await res.json()
-      setCurrentReport(data)
-      setStatus('')
-      setQuery('') // Clear input after successful research
-      fetchReports()
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buf = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const lines = buf.split('\n')
+        buf = lines.pop() ?? ''
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const raw = line.slice(6).trim()
+          if (!raw) continue
+
+          let evt: { type: string; payload: any }
+          try { evt = JSON.parse(raw) } catch { continue }
+
+          handleSSEEvent(evt.type, evt.payload)
+        }
+      }
     } catch (err: any) {
-      setError(err.message || 'Something went wrong. Please try again.')
-      setStatus('')
+      if (err.name !== 'AbortError') {
+        setError(err.message || 'Something went wrong.')
+      }
     } finally {
       setLoading(false)
+      setActiveAgent(null)
+      abortRef.current = null
+    }
+  }
+
+  function handleSSEEvent(type: string, payload: any) {
+    switch (type) {
+      case 'agent_start':
+        setActiveAgent(payload.agent)
+        updateStep(payload.agent, {
+          status: 'running',
+          message: payload.message,
+          subSteps: [],
+        })
+        // Mark previous done agents as done (in case they weren't yet)
+        break
+
+      case 'agent_done':
+        updateStep(payload.agent, {
+          status: 'done',
+          message: payload.message,
+        })
+        break
+
+      case 'researcher_step':
+        addSubStep('researcher', payload.message)
+        updateStep('researcher', { message: payload.message })
+        break
+
+      case 'complete':
+        setCurrentReport(payload)
+        setQuery('')
+        fetchReports()
+        // Mark all steps done
+        setAgentSteps(prev => prev.map(s =>
+          s.status === 'running' ? { ...s, status: 'done' } : s
+        ))
+        break
+
+      case 'error':
+        setError(payload.message || 'Research failed')
+        break
     }
   }
 
@@ -100,19 +209,17 @@ export default function Dashboard() {
     setLoading(true)
     setError('')
     const token = await getToken()
-    
     try {
       const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/reports/${id}`, {
         headers: { Authorization: `Bearer ${token}` }
       })
       if (res.ok) {
-        const data = await res.json()
-        setCurrentReport(data)
+        setCurrentReport(await res.json())
       } else {
         throw new Error('Failed to load report')
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to load report')
+      setError(err.message)
     } finally {
       setLoading(false)
     }
@@ -121,23 +228,17 @@ export default function Dashboard() {
   async function deleteReport(id: string, e: React.MouseEvent) {
     e.stopPropagation()
     if (!confirm('Delete this report?')) return
-
     const token = await getToken()
     try {
       const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/reports/${id}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` }
       })
-      
       if (res.ok) {
         fetchReports()
-        if (currentReport?.id === id) {
-          setCurrentReport(null)
-        }
+        if (currentReport?.id === id) setCurrentReport(null)
       }
-    } catch (err) {
-      console.error('Failed to delete report:', err)
-    }
+    } catch {}
   }
 
   async function handleSignOut() {
@@ -148,21 +249,24 @@ export default function Dashboard() {
   function copyToClipboard() {
     if (!currentReport) return
     navigator.clipboard.writeText(currentReport.report)
-    alert('Report copied to clipboard!')
+    alert('Copied!')
   }
 
   function downloadReport() {
     if (!currentReport) return
     const blob = new Blob([currentReport.report], { type: 'text/plain' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
+    a.href     = url
     a.download = `report-${currentReport.query.slice(0, 30)}-${new Date().toISOString().split('T')[0]}.txt`
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)
     URL.revokeObjectURL(url)
   }
+
+  const doneCount  = agentSteps.filter(s => s.status === 'done').length
+  const totalAgents = agentSteps.length
 
   return (
     <div className="min-h-screen bg-[#07080d] flex">
@@ -173,25 +277,21 @@ export default function Dashboard() {
           <h1 className="text-white font-mono text-lg font-bold tracking-tight">
             Research Committee
           </h1>
-          <p className="text-gray-400 font-mono text-xs mt-1">
-            AI Investment Research
-          </p>
+          <p className="text-gray-400 font-mono text-xs mt-1">AI Investment Research</p>
         </div>
 
         <div className="flex-1 overflow-y-auto p-4">
           <p className="text-gray-500 font-mono text-xs uppercase tracking-widest mb-3">
             Recent Reports ({reports.length})
           </p>
-          
+
           {reports.length === 0 && (
             <div className="text-center py-8">
               <p className="text-gray-500 font-mono text-xs">No reports yet</p>
-              <p className="text-gray-600 font-mono text-xs mt-2">
-                Ask a question to get started
-              </p>
+              <p className="text-gray-600 font-mono text-xs mt-2">Ask a question to get started</p>
             </div>
           )}
-          
+
           <div className="space-y-2">
             {reports.map(report => (
               <div
@@ -203,40 +303,25 @@ export default function Dashboard() {
                 }`}
                 onClick={() => loadReport(report.id)}
               >
-                <p className="text-white font-mono text-xs truncate pr-6">
-                  {report.query}
-                </p>
-                
+                <p className="text-white font-mono text-xs truncate pr-6">{report.query}</p>
                 <div className="flex gap-1 mt-2 flex-wrap">
                   {report.tickers.slice(0, 3).map(t => (
-                    <span
-                      key={t}
-                      className="text-[#4fc3f7] font-mono text-[10px] bg-[#4fc3f7]/10 px-2 py-0.5 rounded"
-                    >
+                    <span key={t} className="text-[#4fc3f7] font-mono text-[10px] bg-[#4fc3f7]/10 px-2 py-0.5 rounded">
                       {t}
                     </span>
                   ))}
                   {report.tickers.length > 3 && (
-                    <span className="text-gray-500 font-mono text-[10px]">
-                      +{report.tickers.length - 3}
-                    </span>
+                    <span className="text-gray-500 font-mono text-[10px]">+{report.tickers.length - 3}</span>
                   )}
                 </div>
-                
                 <p className="text-gray-500 font-mono text-[10px] mt-2">
                   {new Date(report.created_at).toLocaleDateString('en-US', {
-                    month: 'short',
-                    day: 'numeric',
-                    hour: '2-digit',
-                    minute: '2-digit'
+                    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
                   })}
                 </p>
-
-                {/* Delete button - shows on hover */}
                 <button
                   onClick={(e) => deleteReport(report.id, e)}
                   className="absolute top-3 right-3 opacity-0 group-hover:opacity-100 transition-opacity text-gray-500 hover:text-red-400"
-                  title="Delete report"
                 >
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -270,7 +355,7 @@ export default function Dashboard() {
               type="text"
               value={query}
               onChange={e => setQuery(e.target.value)}
-              placeholder="Ask anything — Compare GOOGL vs META, What's driving NVDA, Should I invest in TSLA..."
+              placeholder="Compare GOOGL vs META, What's driving NVDA, Should I invest in TSLA..."
               className="flex-1 bg-[#0f1018] border border-[#1a1b28] text-white placeholder-gray-500 rounded-lg px-4 py-3 text-sm font-mono focus:outline-none focus:border-[#4fc3f7] focus:ring-1 focus:ring-[#4fc3f7] transition-all"
               disabled={loading}
               maxLength={500}
@@ -299,13 +384,6 @@ export default function Dashboard() {
             </button>
           </form>
 
-          {status && (
-            <div className="mt-3 flex items-center gap-2">
-              <div className="w-1 h-1 bg-[#4fc3f7] rounded-full animate-pulse" />
-              <p className="text-gray-400 font-mono text-xs">{status}</p>
-            </div>
-          )}
-
           {error && (
             <div className="mt-3 flex items-center gap-2 bg-red-500/10 border border-red-500/20 rounded-lg px-4 py-2">
               <svg className="w-4 h-4 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -316,8 +394,117 @@ export default function Dashboard() {
           )}
         </div>
 
-        {/* Report display */}
+        {/* Content area */}
         <div className="flex-1 overflow-y-auto p-8">
+
+          {/* ── LIVE PROGRESS PANEL ── */}
+          {loading && (
+            <div className="max-w-2xl mx-auto">
+              {/* Header */}
+              <div className="flex items-center justify-between mb-6">
+                <div className="flex items-center gap-3">
+                  <div className="w-2 h-2 bg-[#4fc3f7] rounded-full animate-pulse" />
+                  <p className="text-white font-mono text-sm font-semibold">
+                    AI Committee Working...
+                  </p>
+                </div>
+                <span className="text-gray-500 font-mono text-xs">
+                  {doneCount}/{totalAgents} agents done
+                </span>
+              </div>
+
+              {/* Progress bar */}
+              <div className="w-full h-1 bg-[#1a1b28] rounded-full mb-8 overflow-hidden">
+                <div
+                  className="h-full bg-[#4fc3f7] rounded-full transition-all duration-500"
+                  style={{ width: `${(doneCount / totalAgents) * 100}%` }}
+                />
+              </div>
+
+              {/* Agent cards */}
+              <div className="space-y-3">
+                {agentSteps.map((step) => (
+                  <div
+                    key={step.agent}
+                    className={`rounded-lg border px-4 py-3 transition-all duration-300 ${
+                      step.status === 'running'
+                        ? 'border-[#4fc3f7]/50 bg-[#4fc3f7]/5'
+                        : step.status === 'done'
+                        ? 'border-[#1a1b28] bg-[#0a0b12]'
+                        : 'border-[#1a1b28] bg-transparent opacity-40'
+                    }`}
+                  >
+                    <div className="flex items-center gap-3">
+                      {/* Status icon */}
+                      <div className="w-6 flex-shrink-0 flex items-center justify-center">
+                        {step.status === 'done' ? (
+                          <svg className="w-4 h-4 text-[#4fc3f7]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+                          </svg>
+                        ) : step.status === 'running' ? (
+                          <svg className="animate-spin w-4 h-4 text-[#4fc3f7]" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                          </svg>
+                        ) : (
+                          <div className="w-3 h-3 rounded-full border border-[#2a2b38]" />
+                        )}
+                      </div>
+
+                      {/* Agent name */}
+                      <span className="text-sm mr-1">{step.icon}</span>
+                      <span className={`font-mono text-xs font-semibold w-28 flex-shrink-0 ${
+                        step.status === 'running' ? 'text-[#4fc3f7]'
+                        : step.status === 'done'  ? 'text-gray-300'
+                        : 'text-gray-600'
+                      }`}>
+                        {step.label}
+                      </span>
+
+                      {/* Status message */}
+                      <span className={`font-mono text-xs truncate ${
+                        step.status === 'running' ? 'text-gray-300'
+                        : step.status === 'done'  ? 'text-gray-500'
+                        : 'text-gray-700'
+                      }`}>
+                        {step.message}
+                      </span>
+                    </div>
+
+                    {/* Sub-steps (Researcher only) */}
+                    {step.status === 'running' && step.subSteps.length > 0 && (
+                      <div className="mt-2 ml-9 space-y-1">
+                        {step.subSteps.map((sub, i) => (
+                          <p
+                            key={i}
+                            className={`font-mono text-[10px] transition-all ${
+                              i === step.subSteps.length - 1 ? 'text-gray-400' : 'text-gray-600'
+                            }`}
+                          >
+                            <span className="text-gray-600 mr-1">↳</span>
+                            {sub}
+                          </p>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              {/* Skeleton lines while waiting */}
+              <div className="mt-8 space-y-3">
+                {[...Array(4)].map((_, i) => (
+                  <div
+                    key={i}
+                    className="h-3 bg-[#0f1018] rounded animate-pulse"
+                    style={{ width: `${55 + (i * 11) % 35}%`, animationDelay: `${i * 150}ms` }}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ── EMPTY STATE ── */}
           {!currentReport && !loading && (
             <div className="flex flex-col items-center justify-center h-full gap-6">
               <div className="text-center">
@@ -329,7 +516,7 @@ export default function Dashboard() {
                 <p className="text-white font-mono text-sm mb-2">No report selected</p>
                 <p className="text-gray-500 font-mono text-xs">Ask a question or select a report from the sidebar</p>
               </div>
-              
+
               <div className="flex flex-col gap-2 w-full max-w-md">
                 <p className="text-gray-500 font-mono text-xs uppercase tracking-widest mb-2 text-center">
                   Example queries
@@ -338,70 +525,48 @@ export default function Dashboard() {
                   "What's the outlook for NVDA next quarter?",
                   "Compare TSLA vs competitors on valuation",
                   "What's driving META's stock price lately?",
-                ].map(example => (
+                ].map(ex => (
                   <button
-                    key={example}
-                    onClick={() => setQuery(example)}
+                    key={ex}
+                    onClick={() => setQuery(ex)}
                     className="text-left text-gray-400 font-mono text-xs hover:text-[#4fc3f7] hover:bg-[#0f1018] transition-all px-4 py-3 rounded-lg border border-[#1a1b28] hover:border-[#2a2b38]"
                   >
-                    {example}
+                    {ex}
                   </button>
                 ))}
               </div>
             </div>
           )}
 
-          {loading && (
-            <div className="space-y-4 max-w-4xl">
-              <div className="flex items-center gap-3 mb-6">
-                <div className="w-2 h-2 bg-[#4fc3f7] rounded-full animate-pulse" />
-                <p className="text-gray-400 font-mono text-sm">Analyzing your query...</p>
-              </div>
-              {[...Array(5)].map((_, i) => (
-                <div
-                  key={i}
-                  className="h-4 bg-[#0f1018] rounded animate-pulse"
-                  style={{ width: `${Math.random() * 40 + 40}%` }}
-                />
-              ))}
-            </div>
-          )}
-
+          {/* ── REPORT ── */}
           {currentReport && !loading && (
             <div className="max-w-4xl">
-              {/* Report Header */}
               <div className="mb-6 pb-6 border-b border-[#1a1b28]">
                 <div className="flex items-start justify-between mb-4">
                   <div className="flex-1">
                     <h2 className="text-white font-mono text-xl mb-2">{currentReport.query}</h2>
                     <div className="flex gap-2 flex-wrap">
                       {currentReport.tickers.map(ticker => (
-                        <span
-                          key={ticker}
-                          className="text-[#4fc3f7] font-mono text-xs bg-[#4fc3f7]/10 px-3 py-1 rounded-full"
-                        >
+                        <span key={ticker} className="text-[#4fc3f7] font-mono text-xs bg-[#4fc3f7]/10 px-3 py-1 rounded-full">
                           {ticker}
                         </span>
                       ))}
                     </div>
                   </div>
-                  
-                  {/* Export Menu */}
+
                   <div className="relative">
                     <button
                       onClick={() => setShowExportMenu(!showExportMenu)}
                       className="text-gray-400 hover:text-white transition-colors p-2"
-                      title="Export options"
                     >
                       <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 5v.01M12 12v.01M12 19v.01M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z" />
                       </svg>
                     </button>
-                    
                     {showExportMenu && (
                       <div className="absolute right-0 mt-2 w-48 bg-[#0f1018] border border-[#1a1b28] rounded-lg shadow-xl z-10">
                         <button
-                          onClick={() => { copyToClipboard(); setShowExportMenu(false); }}
+                          onClick={() => { copyToClipboard(); setShowExportMenu(false) }}
                           className="w-full text-left px-4 py-2 text-gray-400 hover:text-white hover:bg-[#1a1b28] transition-colors font-mono text-xs flex items-center gap-2"
                         >
                           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -410,7 +575,7 @@ export default function Dashboard() {
                           Copy to clipboard
                         </button>
                         <button
-                          onClick={() => { downloadReport(); setShowExportMenu(false); }}
+                          onClick={() => { downloadReport(); setShowExportMenu(false) }}
                           className="w-full text-left px-4 py-2 text-gray-400 hover:text-white hover:bg-[#1a1b28] transition-colors font-mono text-xs flex items-center gap-2"
                         >
                           <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -422,27 +587,22 @@ export default function Dashboard() {
                     )}
                   </div>
                 </div>
-                
+
                 <p className="text-gray-500 font-mono text-xs">
                   {new Date(currentReport.created_at).toLocaleDateString('en-US', {
-                    year: 'numeric',
-                    month: 'long',
-                    day: 'numeric',
-                    hour: '2-digit',
-                    minute: '2-digit'
+                    year: 'numeric', month: 'long', day: 'numeric',
+                    hour: '2-digit', minute: '2-digit'
                   })}
                 </p>
               </div>
 
-              {/* Report Content */}
               <div className="prose prose-invert prose-sm max-w-none">
                 <pre className="whitespace-pre-wrap text-gray-300 text-sm leading-relaxed font-mono bg-transparent border-0 p-0">
                   {currentReport.report}
                 </pre>
               </div>
 
-              {/* Sources */}
-              {currentReport.sources && currentReport.sources.length > 0 && (
+              {currentReport.sources?.length > 0 && (
                 <div className="mt-8 pt-6 border-t border-[#1a1b28]">
                   <p className="text-gray-500 font-mono text-xs uppercase tracking-widest mb-4">
                     Sources ({currentReport.sources.length})
@@ -459,9 +619,7 @@ export default function Dashboard() {
                         <p className="text-[#4fc3f7] font-mono text-xs group-hover:text-[#81d4fa] transition-colors">
                           {source.title || source.url}
                         </p>
-                        <p className="text-gray-600 font-mono text-[10px] mt-1 truncate">
-                          {source.url}
-                        </p>
+                        <p className="text-gray-600 font-mono text-[10px] mt-1 truncate">{source.url}</p>
                       </a>
                     ))}
                   </div>
