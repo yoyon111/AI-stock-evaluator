@@ -1,6 +1,8 @@
 'use client'
 
 import { useState, useEffect, useRef } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { createClient } from './lib/supabase'
 import { useRouter } from 'next/navigation'
 
@@ -597,9 +599,36 @@ export default function Dashboard() {
               </div>
 
               <div className="prose prose-invert prose-sm max-w-none">
-                <pre className="whitespace-pre-wrap text-gray-300 text-sm leading-relaxed font-mono bg-transparent border-0 p-0">
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  components={{
+                    h1: ({children}) => <h1 className="text-white font-mono text-xl font-bold mt-8 mb-3 pb-2 border-b border-[#1a1b28]">{children}</h1>,
+                    h2: ({children}) => <h2 className="text-white font-mono text-lg font-bold mt-7 mb-3 pb-2 border-b border-[#1a1b28]">{children}</h2>,
+                    h3: ({children}) => <h3 className="text-[#4fc3f7] font-mono text-sm font-semibold mt-5 mb-2">{children}</h3>,
+                    p: ({children}) => <p className="text-gray-300 font-mono text-sm leading-relaxed mb-4">{children}</p>,
+                    strong: ({children}) => <strong className="text-white font-semibold">{children}</strong>,
+                    em: ({children}) => <em className="text-gray-300 italic">{children}</em>,
+                    ul: ({children}) => <ul className="space-y-1 mb-4 ml-4">{children}</ul>,
+                    ol: ({children}) => <ol className="space-y-1 mb-4 ml-4 list-decimal">{children}</ol>,
+                    li: ({children}) => <li className="text-gray-300 font-mono text-sm flex gap-2"><span className="text-[#4fc3f7] mt-0.5 flex-shrink-0">·</span><span>{children}</span></li>,
+                    blockquote: ({children}) => <blockquote className="border-l-2 border-[#4fc3f7] pl-4 my-4 text-gray-400 italic">{children}</blockquote>,
+                    code: ({children}) => <code className="text-[#4fc3f7] bg-[#0f1018] px-1.5 py-0.5 rounded text-xs font-mono">{children}</code>,
+                    table: ({children}) => (
+                      <div className="overflow-x-auto my-6">
+                        <table className="w-full border-collapse font-mono text-xs">{children}</table>
+                      </div>
+                    ),
+                    thead: ({children}) => <thead>{children}</thead>,
+                    tbody: ({children}) => <tbody>{children}</tbody>,
+                    tr: ({children}) => <tr className="border-b border-[#1a1b28]">{children}</tr>,
+                    th: ({children}) => <th className="text-[#4fc3f7] font-semibold text-left px-4 py-2 bg-[#0f1018] border border-[#1a1b28]">{children}</th>,
+                    td: ({children}) => <td className="text-gray-300 px-4 py-2 border border-[#1a1b28]">{children}</td>,
+                    hr: () => <hr className="border-[#1a1b28] my-6" />,
+                    a: ({href, children}) => <a href={href} target="_blank" rel="noopener noreferrer" className="text-[#4fc3f7] hover:text-[#81d4fa] underline underline-offset-2">{children}</a>,
+                  }}
+                >
                   {currentReport.report.replace(/\n*##\s*Sources[\s\S]*$/i, '').trimEnd()}
-                </pre>
+                </ReactMarkdown>
               </div>
 
               {currentReport.sources?.length > 0 && (
