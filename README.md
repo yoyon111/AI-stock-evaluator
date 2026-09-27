@@ -1,5 +1,5 @@
 # AI Stock Evaluator
-Run locally with http://127.0.0.1:3000
+
 An AI-powered stock research application that helps users analyze companies and generate investment research reports.
 
 ## Overview
